@@ -104,8 +104,7 @@ function read_datasets(name::String)::NamedTrainTestDataset
     name = lowercase(name)
 
     if name in ["mnist", "cifar10"]
-        dir = joinpath("datasets", name)
-
+        dir = joinpath("datasets/", name)
         m_train = prep_data_file(dir, "$(name)_int_train.mat") |> matread
         train = LabelledImageDataset(m_train["images"] / 255, m_train["labels"][:])
 

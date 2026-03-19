@@ -64,7 +64,7 @@ function get_conv_params(
     matrix_name::String = "weight",
     bias_name::String = "bias",
     expected_stride::Integer = 1,
-    padding::Padding = SamePadding(),
+    padding::Padding = ValidPadding(),
 )::Conv2d
 
     params = Conv2d(

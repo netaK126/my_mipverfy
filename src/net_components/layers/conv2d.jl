@@ -24,7 +24,7 @@ Represents 2-D convolution operation.
 ## Fields:
 $(FIELDS)
 """
-struct Conv2d{T<:JuMPReal,U<:JuMPReal,V<:Integer} <: Layer
+mutable struct Conv2d{T<:JuMPReal,U<:JuMPReal,V<:Integer} <: Layer
     filter::Array{T,4}
     bias::Array{U,1}
     stride::V

@@ -84,7 +84,13 @@ arithmetic, as a backup.
   this to `b_0` and return the better result.
 - For all other solve statuses, we warn the user and report `b_0`.
 """
-function tight_bound_helper(m::Model, bound_type::BoundType, objective::JuMPLinearType, b_0::Number)
+function tight_bound_helper(m::Model, bound_type::BoundType, objective::JuMPLinearType, b_0::Number
+)
+    if reuse_bounds_conf.is_reuse_bounds_and_deps
+        b = reuse_bounds_conf.reusable_bounds[reuse_bounds_conf.reusable_indexes]
+        reuse_bounds_conf.reusable_indexes += 1
+        return b
+    end
     @objective(m, bound_obj[bound_type], objective)
     optimize!(m)
     status = JuMP.termination_status(m)
@@ -98,14 +104,17 @@ function tight_bound_helper(m::Model, bound_type::BoundType, objective::JuMPLine
                 "Δb = $(db). Tightening via interval arithmetic should not give a better result than an optimal optimization.",
             )
         end
+        append!(reuse_bounds_conf.reusable_bounds, b)
         return b
     elseif status == MathOptInterface.TIME_LIMIT
+        append!(reuse_bounds_conf.reusable_bounds, b_0)
         return b_0
     else
         Memento.warn(
             MIPVerify.LOGGER,
             "Unexpected solve status $(status); using interval_arithmetic to obtain bound.",
         )
+        append!(reuse_bounds_conf.reusable_bounds, b_0)
         return b_0
     end
 end
@@ -172,6 +181,12 @@ function relu(x::AbstractArray{T}) where {T<:Real}
 end
 
 function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
+    global network_version
+    global layer_counter
+    global nueron_counter
+    
+    neurons_names.neuron += 1
+
     if u < l
         # TODO (vtjeng): This check is in place in case of numerical error in the calculation of bounds.
         # See sample number 4872 (1-indexed) when verified on the lp0.4 network.
@@ -197,11 +212,111 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         # rectified value is always x
         return x
     else
-        # since we know that u!=l, x is not constant, and thus x must have an associated model
         model = owner_model(x)
+
+        # ── Conditional-triangle relaxations (n2_org and n2_pert passes) ────────
+        # BRIDGE paper Section 5, eqs. (4) and (6).
+        #
+        # Both relaxations condition on a_n1_org (Npre's binary) and use Npre's
+        # pre-activation bounds [l_pre, u_pre].  They differ only in which
+        # interval bounds are used:
+        #
+        #   n2_org (activation relaxation, eq. 4):
+        #     interval = diff bounds [l_diff, u_diff] = z_n2_org - z_n1_org
+        #     threshold: u_diff - l_diff < T_relax
+        #
+        #   n2_pert (perturbation relaxation, eq. 6):
+        #     interval = composed bounds [l_comp, u_comp] = diff + pert
+        #                                               = z_n2_pert - z_n1_org
+        #     threshold: u_comp - l_comp < T_relax
+        #
+        # Conditional intervals (same formula for both, with their respective bounds):
+        #   Active   (a_n1_org=1): zˆ ∈ [l_int,       u_pre + u_int]
+        #   Inactive (a_n1_org=0): zˆ ∈ [l_pre + l_int, u_int      ]
+        #
+        # l < 0 < u is guaranteed (split case). Big-M = u + |l|.
+        if use_relaxations && (network_version == "n2_org" || network_version == "n2_pert")
+            m_idx = neurons_names.layer   # ReLU layer index (1-based)
+            k_idx = neurons_names.neuron  # neuron index within the layer (1-based)
+
+            # Select the correct interval bounds for this pass
+            bounds_up   = (network_version == "n2_org") ? relu_diff_up_bounds   : relu_comp_up_bounds
+            bounds_down = (network_version == "n2_org") ? relu_diff_down_bounds : relu_comp_down_bounds
+
+            if m_idx <= length(bounds_up) && k_idx <= length(bounds_up[m_idx])
+                u_int = bounds_up[m_idx][k_idx]
+                l_int = bounds_down[m_idx][k_idx]
+
+                if (u_int - l_int) < relaxation_threshold
+                    # Look up a_n1_org — Npre's binary for this neuron (same for both passes)
+                    a_pre_name = string("n1_orga_layerCount", layer_counter,
+                                        "_neuronCount", nueron_counter,
+                                        "_", m_idx, "_", k_idx)
+                    a_pre = variable_by_name(model, a_pre_name)
+
+                    if a_pre !== nothing &&
+                       m_idx <= length(n1_preact_up_bounds) &&
+                       k_idx <= length(n1_preact_up_bounds[m_idx])
+
+                        u_pre = n1_preact_up_bounds[m_idx][k_idx]
+                        l_pre = n1_preact_down_bounds[m_idx][k_idx]
+
+                        # Conditional intervals (paper eqs. 4 / 6)
+                        lA = l_int;          uA = u_pre + u_int   # active   (a_n1_org=1)
+                        lI = l_pre + l_int;  uI = u_int           # inactive (a_n1_org=0)
+
+                        av = JuMP.all_variables(model)
+                        push!(layers_info_dict,
+                              (neurons_names.layer, neurons_names.neuron) => (u, l, length(av)))
+
+                        x_rect = @variable(model)
+                        set_lower_bound(x_rect, 0.0)
+                        set_upper_bound(x_rect, max(max(0.0, uA), max(0.0, uI)))
+                        set_name(x_rect, string(network_version, "x_rect",
+                                                "_layerCount", layer_counter,
+                                                "_neuronCount", nueron_counter,
+                                                "_", m_idx, "_", k_idx))
+
+                        M = u + (-l)  # u + |l|, l < 0 guaranteed
+
+                        # Base constraints (always hold)
+                        @constraint(model, x_rect >= 0)
+                        @constraint(model, x_rect >= x)
+
+                        # Active-case upper bound (binding when a_n1_org=1, relaxed when 0)
+                        if lA >= 0.0
+                            @constraint(model, x_rect <= x + M * (1 - a_pre))
+                        elseif uA <= 0.0
+                            @constraint(model, x_rect <= M * (1 - a_pre))
+                        else
+                            @constraint(model, x_rect <=
+                                (uA / (uA - lA)) * (x - lA) + M * (1 - a_pre))
+                        end
+
+                        # Inactive-case upper bound (binding when a_n1_org=0, relaxed when 1)
+                        if lI >= 0.0
+                            @constraint(model, x_rect <= x + M * a_pre)
+                        elseif uI <= 0.0
+                            @constraint(model, x_rect <= M * a_pre)
+                        else
+                            @constraint(model, x_rect <=
+                                (uI / (uI - lI)) * (x - lI) + M * a_pre)
+                        end
+
+                        return x_rect
+                    end
+                end
+            end
+        end
+
+        # ── Standard exact ReLU encoding (binary variable) ───────────────────
+        av = JuMP.all_variables(model)
+        push!(layers_info_dict,(neurons_names.layer,neurons_names.neuron)=>(u,l,length(av)))
+        # since we know that u!=l, x is not constant, and thus x must have an associated model
         x_rect = @variable(model)
         a = @variable(model, binary = true)
-
+    	set_name(x_rect,string(network_version,"x_rect","_","layerCount",layer_counter,"_","neuronCount",nueron_counter,"_",string(neurons_names.layer),"_",string(neurons_names.neuron)))
+    	set_name(a,string(network_version,"a","_","layerCount",layer_counter,"_","neuronCount",nueron_counter,"_",string(neurons_names.layer),"_",string(neurons_names.neuron)))
         # refined big-M formulation that takes advantage of the knowledge
         # that lower and upper bounds  are different.
         @constraint(model, x_rect <= x + (-l) * (1 - a))
@@ -277,6 +392,12 @@ function relu(
 )::Array{JuMP.AffExpr} where {T<:JuMPLinearType}
     show_progress_bar::Bool =
         MIPVerify.LOGGER.levels[MIPVerify.LOGGER.level] > MIPVerify.LOGGER.levels["debug"]
+    neurons_names.neuron = 0
+    neurons_names.layer += 1
+    global layer_counter
+	global nueron_counter
+    layer_counter += 1
+    nueron_counter = 0
     if !show_progress_bar
         u = tight_upperbound.(x, nta = nta, cutoff = 0)
         l = lazy_tight_lowerbound.(x, u, nta = nta, cutoff = 0)
@@ -534,7 +655,7 @@ function set_max_indexes(
     model::Model,
     xs::Array{<:JuMPLinearType,1},
     target_indexes::Array{<:Integer,1};
-    margin::Real = 0,
+    margin::Real = 0.001,
 )::Nothing
 
     (maximum_target_var, nontarget_vars) = get_vars_for_max_index(xs, target_indexes)
