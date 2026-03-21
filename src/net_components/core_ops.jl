@@ -236,9 +236,9 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         #
         # l < 0 < u is guaranteed (split case). Big-M = u + |l|.
         if use_relaxations && (network_version == "n2_org" || network_version == "n2_pert")
-            m_idx = neurons_names.layer   # ReLU layer index (1-based)
+            m_idx = layer_counter         # ReLU layer index within current network (1-based, reset per pass)
             k_idx = neurons_names.neuron  # neuron index within the layer (1-based)
-
+            #NETA
             # Select the correct interval bounds for this pass
             bounds_up   = (network_version == "n2_org") ? relu_diff_up_bounds   : relu_comp_up_bounds
             bounds_down = (network_version == "n2_org") ? relu_diff_down_bounds : relu_comp_down_bounds
@@ -246,8 +246,9 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
             if m_idx <= length(bounds_up) && k_idx <= length(bounds_up[m_idx])
                 u_int = bounds_up[m_idx][k_idx]
                 l_int = bounds_down[m_idx][k_idx]
+                int_width = u_int - l_int
 
-                if (u_int - l_int) < relaxation_threshold
+                if int_width < relaxation_threshold
                     # Look up a_n1_org — Npre's binary for this neuron (same for both passes)
                     a_pre_name = string("n1_orga_layerCount", layer_counter,
                                         "_neuronCount", nueron_counter,
