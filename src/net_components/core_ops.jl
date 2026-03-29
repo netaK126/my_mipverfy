@@ -214,6 +214,92 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
     else
         model = owner_model(x)
 
+        # Helper for triangle relaxation-gap area scoring (used by both relaxation paths)
+        _tri_gap(l_val, u_val) = (l_val >= 0.0 || u_val <= 0.0) ? 0.0 : u_val * (-l_val) / (2.0 * (u_val - l_val))
+
+        # ── N2-only perturbation relaxation (--no_n1_binaries_and_relaxtions_only_on_n2) ──
+        # Relax N2(x_p) by conditioning on N2(x) binary (a_n2_org) using
+        # perturbation bounds through N2 (z_n2_pert - z_n2_org).
+        # N2(x) stays exact; N1(x) is LP-relaxed (handled below in standard encoding).
+        if no_n1_binaries_and_relaxtions_only_on_n2 && network_version == "n2_pert"
+            m_idx = layer_counter
+            k_idx = neurons_names.neuron
+
+            if m_idx <= length(relu_n2pert_up_bounds) && k_idx <= length(relu_n2pert_up_bounds[m_idx])
+                u_int = relu_n2pert_up_bounds[m_idx][k_idx]
+                l_int = relu_n2pert_down_bounds[m_idx][k_idx]
+                int_width = u_int - l_int
+
+                relax_score = int_width
+                if relaxation_gap_area
+                    if m_idx <= length(n2_preact_up_bounds) && k_idx <= length(n2_preact_up_bounds[m_idx])
+                        u_pre_tmp = n2_preact_up_bounds[m_idx][k_idx]
+                        l_pre_tmp = n2_preact_down_bounds[m_idx][k_idx]
+                        lA_tmp = l_int;              uA_tmp = u_pre_tmp + u_int
+                        lI_tmp = l_pre_tmp + l_int;  uI_tmp = u_int
+                        relax_score = max(_tri_gap(lA_tmp, uA_tmp), _tri_gap(lI_tmp, uI_tmp))
+                    end
+                end
+
+                if relax_score < relaxation_threshold
+                    global relaxation_condition_count += 1
+                    # Condition on N2(x) binary instead of N1(x)
+                    a_pre_name = string("n2_org", "a_layerCount", layer_counter,
+                                        "_neuronCount", nueron_counter,
+                                        "_", m_idx, "_", k_idx)
+                    a_pre = variable_by_name(model, a_pre_name)
+
+                    if a_pre !== nothing &&
+                       m_idx <= length(n2_preact_up_bounds) &&
+                       k_idx <= length(n2_preact_up_bounds[m_idx])
+
+                        u_pre = n2_preact_up_bounds[m_idx][k_idx]
+                        l_pre = n2_preact_down_bounds[m_idx][k_idx]
+
+                        lA = l_int;          uA = u_pre + u_int   # active   (a_n2_org=1)
+                        lI = l_pre + l_int;  uI = u_int           # inactive (a_n2_org=0)
+
+                        av = JuMP.all_variables(model)
+                        push!(layers_info_dict,
+                              (neurons_names.layer, neurons_names.neuron) => (u, l, length(av)))
+
+                        x_rect = @variable(model)
+                        set_lower_bound(x_rect, 0.0)
+                        set_upper_bound(x_rect, max(max(0.0, uA), max(0.0, uI)))
+                        set_name(x_rect, string(network_version, "x_rect",
+                                                "_layerCount", layer_counter,
+                                                "_neuronCount", nueron_counter,
+                                                "_", m_idx, "_", k_idx))
+
+                        M = u + (-l)
+
+                        @constraint(model, x_rect >= 0)
+                        @constraint(model, x_rect >= x)
+
+                        if lA >= 0.0
+                            @constraint(model, x_rect <= x + M * (1 - a_pre))
+                        elseif uA <= 0.0
+                            @constraint(model, x_rect <= M * (1 - a_pre))
+                        else
+                            @constraint(model, x_rect <=
+                                (uA / (uA - lA)) * (x - lA) + M * (1 - a_pre))
+                        end
+
+                        if lI >= 0.0
+                            @constraint(model, x_rect <= x + M * a_pre)
+                        elseif uI <= 0.0
+                            @constraint(model, x_rect <= M * a_pre)
+                        else
+                            @constraint(model, x_rect <=
+                                (uI / (uI - lI)) * (x - lI) + M * a_pre)
+                        end
+
+                        return x_rect
+                    end
+                end
+            end
+        end
+
         # ── Conditional-triangle relaxations (n2_org and n2_pert passes) ────────
         # BRIDGE paper Section 5, eqs. (4) and (6).
         #
@@ -235,11 +321,13 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         #   Inactive (a_n1_org=0): zˆ ∈ [l_pre + l_int, u_int      ]
         #
         # l < 0 < u is guaranteed (split case). Big-M = u + |l|.
-        if use_relaxations && (network_version == "n2_org" || network_version == "n2_pert")
+        # Skip when no_n1_binaries_and_relaxtions_only_on_n2 is active (N1 binaries are LP-relaxed).
+        if use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && (network_version == "n2_org" || network_version == "n2_pert" || network_version == "perturbation")
             m_idx = layer_counter         # ReLU layer index within current network (1-based, reset per pass)
             k_idx = neurons_names.neuron  # neuron index within the layer (1-based)
             #NETA
             # Select the correct interval bounds for this pass
+            # n2_org (transfer): diff bounds;  n2_pert / perturbation: composed/pert bounds
             bounds_up   = (network_version == "n2_org") ? relu_diff_up_bounds   : relu_comp_up_bounds
             bounds_down = (network_version == "n2_org") ? relu_diff_down_bounds : relu_comp_down_bounds
 
@@ -248,9 +336,27 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
                 l_int = bounds_down[m_idx][k_idx]
                 int_width = u_int - l_int
 
-                if int_width < relaxation_threshold
-                    # Look up a_n1_org — Npre's binary for this neuron (same for both passes)
-                    a_pre_name = string("n1_orga_layerCount", layer_counter,
+                # Decide whether to relax: either by interval width or by gap area
+                relax_score = int_width  # default: interval width
+                if relaxation_gap_area
+                    # Method 2: triangle relaxation-gap area scoring
+                    # Requires preact bounds to compute conditional intervals
+                    if m_idx <= length(n1_preact_up_bounds) && k_idx <= length(n1_preact_up_bounds[m_idx])
+                        u_pre_tmp = n1_preact_up_bounds[m_idx][k_idx]
+                        l_pre_tmp = n1_preact_down_bounds[m_idx][k_idx]
+                        lA_tmp = l_int;              uA_tmp = u_pre_tmp + u_int
+                        lI_tmp = l_pre_tmp + l_int;  uI_tmp = u_int
+                        relax_score = max(_tri_gap(lA_tmp, uA_tmp), _tri_gap(lI_tmp, uI_tmp))
+                    end
+                end
+
+                if relax_score < relaxation_threshold
+                    global relaxation_condition_count += 1
+                    # Look up the predecessor network's binary for this neuron:
+                    #   transfer mode (n2_org/n2_pert): prefix = "n1_org"
+                    #   standard mode (perturbation):   prefix = "org"
+                    a_pre_prefix = (network_version == "perturbation") ? "org" : "n1_org"
+                    a_pre_name = string(a_pre_prefix, "a_layerCount", layer_counter,
                                         "_neuronCount", nueron_counter,
                                         "_", m_idx, "_", k_idx)
                     a_pre = variable_by_name(model, a_pre_name)
@@ -315,7 +421,14 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         push!(layers_info_dict,(neurons_names.layer,neurons_names.neuron)=>(u,l,length(av)))
         # since we know that u!=l, x is not constant, and thus x must have an associated model
         x_rect = @variable(model)
-        a = @variable(model, binary = true)
+        # LP-relax N1 binaries when no_n1_binaries_and_relaxtions_only_on_n2 is active
+        if no_n1_binaries_and_relaxtions_only_on_n2 && network_version == "n1_org"
+            a = @variable(model)
+            set_lower_bound(a, 0.0)
+            set_upper_bound(a, 1.0)
+        else
+            a = @variable(model, binary = true)
+        end
     	set_name(x_rect,string(network_version,"x_rect","_","layerCount",layer_counter,"_","neuronCount",nueron_counter,"_",string(neurons_names.layer),"_",string(neurons_names.neuron)))
     	set_name(a,string(network_version,"a","_","layerCount",layer_counter,"_","neuronCount",nueron_counter,"_",string(neurons_names.layer),"_",string(neurons_names.neuron)))
         # refined big-M formulation that takes advantage of the knowledge
