@@ -11,7 +11,7 @@ Represents matrix multiplication.
 ## Fields:
 $(FIELDS)
 """
-struct Linear{T<:Real,U<:Real} <: Layer
+mutable struct Linear{T<:Real,U<:Real} <: Layer
     matrix::Array{T,2}
     bias::Array{U,1}
 

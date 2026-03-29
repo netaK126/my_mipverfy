@@ -84,7 +84,13 @@ arithmetic, as a backup.
   this to `b_0` and return the better result.
 - For all other solve statuses, we warn the user and report `b_0`.
 """
-function tight_bound_helper(m::Model, bound_type::BoundType, objective::JuMPLinearType, b_0::Number)
+function tight_bound_helper(m::Model, bound_type::BoundType, objective::JuMPLinearType, b_0::Number
+)
+    if reuse_bounds_conf.is_reuse_bounds_and_deps
+        b = reuse_bounds_conf.reusable_bounds[reuse_bounds_conf.reusable_indexes]
+        reuse_bounds_conf.reusable_indexes += 1
+        return b
+    end
     @objective(m, bound_obj[bound_type], objective)
     optimize!(m)
     status = JuMP.termination_status(m)
@@ -98,14 +104,17 @@ function tight_bound_helper(m::Model, bound_type::BoundType, objective::JuMPLine
                 "Δb = $(db). Tightening via interval arithmetic should not give a better result than an optimal optimization.",
             )
         end
+        append!(reuse_bounds_conf.reusable_bounds, b)
         return b
     elseif status == MathOptInterface.TIME_LIMIT
+        append!(reuse_bounds_conf.reusable_bounds, b_0)
         return b_0
     else
         Memento.warn(
             MIPVerify.LOGGER,
             "Unexpected solve status $(status); using interval_arithmetic to obtain bound.",
         )
+        append!(reuse_bounds_conf.reusable_bounds, b_0)
         return b_0
     end
 end
@@ -172,6 +181,8 @@ function relu(x::AbstractArray{T}) where {T<:Real}
 end
 
 function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
+    neurons_names.neuron += 1
+
     if u < l
         # TODO (vtjeng): This check is in place in case of numerical error in the calculation of bounds.
         # See sample number 4872 (1-indexed) when verified on the lp0.4 network.
@@ -197,11 +208,14 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         # rectified value is always x
         return x
     else
-        # since we know that u!=l, x is not constant, and thus x must have an associated model
         model = owner_model(x)
+        av = JuMP.all_variables(model)
+        push!(layers_info_dict,(neurons_names.layer,neurons_names.neuron)=>(u,l,length(av)))
+        # since we know that u!=l, x is not constant, and thus x must have an associated model
         x_rect = @variable(model)
         a = @variable(model, binary = true)
-
+    	set_name(x_rect,string("x_rect",string(neurons_names.layer),"_",string(neurons_names.neuron)))
+    	set_name(a,string("a",string(neurons_names.layer),"_",string(neurons_names.neuron)))
         # refined big-M formulation that takes advantage of the knowledge
         # that lower and upper bounds  are different.
         @constraint(model, x_rect <= x + (-l) * (1 - a))
@@ -277,6 +291,8 @@ function relu(
 )::Array{JuMP.AffExpr} where {T<:JuMPLinearType}
     show_progress_bar::Bool =
         MIPVerify.LOGGER.levels[MIPVerify.LOGGER.level] > MIPVerify.LOGGER.levels["debug"]
+    neurons_names.neuron = 0
+    neurons_names.layer += 1
     if !show_progress_bar
         u = tight_upperbound.(x, nta = nta, cutoff = 0)
         l = lazy_tight_lowerbound.(x, u, nta = nta, cutoff = 0)
@@ -534,7 +550,7 @@ function set_max_indexes(
     model::Model,
     xs::Array{<:JuMPLinearType,1},
     target_indexes::Array{<:Integer,1};
-    margin::Real = 0,
+    margin::Real = 0.001,
 )::Nothing
 
     (maximum_target_var, nontarget_vars) = get_vars_for_max_index(xs, target_indexes)
