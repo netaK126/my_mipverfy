@@ -198,6 +198,18 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         l = lower_bound(x)
     end
 
+    # Tighten N2 bounds using derived N1 + diff bounds
+    if tighten_n2_bounds && (network_version == "n2_org" || network_version == "n2_pert")
+        m_idx = layer_counter
+        k_idx = neurons_names.neuron
+        if m_idx >= 1 && m_idx <= length(n2_derived_preact_up_bounds) && k_idx >= 1 && k_idx <= length(n2_derived_preact_up_bounds[m_idx])
+            u_derived = n2_derived_preact_up_bounds[m_idx][k_idx]
+            l_derived = n2_derived_preact_down_bounds[m_idx][k_idx]
+            u = min(u, u_derived)
+            l = max(l, l_derived)
+        end
+    end
+
     if u <= 0
         # rectified value is always 0
         return zero(T)
