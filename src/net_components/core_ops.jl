@@ -10,8 +10,7 @@ with it. This can only be true if it is an affine expression with no stored
 variables.
 """
 function is_constant(x::JuMP.AffExpr)
-    # TODO (vtjeng): Determine whether there is a built-in function for this as of JuMP>=0.19
-    all(values(x.terms) .== 0)
+    return iszero(x - JuMP.constant(x))
 end
 
 function is_constant(x::JuMP.VariableRef)
@@ -373,6 +372,19 @@ function maximum_of_constants(xs::AbstractArray{T}) where {T<:JuMPLinearType}
     return one(JuMP.VariableRef) * max_val
 end
 
+function log_maximum_candidate_count(model::Model, num_candidates::Integer, num_inputs::Integer)
+    counter_key = :MIPVerifyMaximumCallCount
+    call_count = get(model.ext, counter_key, 0) + 1
+    model.ext[counter_key] = call_count
+
+    log_message = "Maximum call #$(call_count): $(num_candidates) of $(num_inputs) inputs can still attain the maximum."
+    if call_count == 1
+        Memento.info(MIPVerify.LOGGER, log_message)
+    else
+        Memento.debug(MIPVerify.LOGGER, log_message)
+    end
+end
+
 """
 $(SIGNATURES)
 Expresses a maximization constraint: output is constrained to be equal to `max(xs)`.
@@ -388,8 +400,6 @@ function maximum(xs::AbstractArray{T})::JuMP.AffExpr where {T<:JuMPLinearType}
     # at least one of xs is not constant.
     model = owner_model(xs)
 
-    # TODO (vtjeng): [PERF] skip calculating lower_bound for index if upper_bound is lower than
-    # largest current lower_bound.
     p1 = Progress(length(xs), desc = "  Calculating upper bounds: ", enabled = isinteractive())
     us = map(x_i -> (next!(p1); tight_upperbound(x_i)), xs)
     p2 = Progress(length(xs), desc = "  Calculating lower bounds: ", enabled = isinteractive())
@@ -403,15 +413,10 @@ function maximum(xs::AbstractArray{T})::JuMP.AffExpr where {T<:JuMPLinearType}
         Memento.info(MIPVerify.LOGGER, "Output of maximum is constant.")
     end
     # at least one index will satisfy this property because of check above.
-    filtered_indexes = us .> l
+    active_indexes = findall(us .> l)
+    log_maximum_candidate_count(model, length(active_indexes), length(xs))
 
-    # TODO (vtjeng): Smarter log output if maximum function is being used more than once (for example, in a max-pooling layer).
-    Memento.info(
-        MIPVerify.LOGGER,
-        "Number of inputs to maximum function possibly taking maximum value: $(filtered_indexes |> sum)",
-    )
-
-    return maximum(xs[filtered_indexes], ls[filtered_indexes], us[filtered_indexes])
+    return maximum(xs[active_indexes], ls[active_indexes], us[active_indexes])
 end
 
 function maximum(
@@ -542,7 +547,7 @@ end
 """
 $(SIGNATURES)
 
-Imposes constraints ensuring that one of the elements at the target_indexes is the
+Imposes constraints ensuring that one of the elements at the target_indexes is (tied for) the
 largest element of the array x. More specifically, we require `x[j] - x[i] ≥ margin` for
 some `j ∈ target_indexes` and for all `i ∉ target_indexes`.
 """
@@ -555,6 +560,9 @@ function set_max_indexes(
 
     (maximum_target_var, nontarget_vars) = get_vars_for_max_index(xs, target_indexes)
 
+    # JuMP does not support strict inequalities; see 
+    # https://github.com/jump-dev/JuMP.jl/blob/24c0409c5fa5cae6a4ae64b1c82ab5f83d55fbc6/src/macros/%40variable.jl#L516-L523
+    # for more context.
     @constraint(model, nontarget_vars .<= maximum_target_var - margin)
     return nothing
 end

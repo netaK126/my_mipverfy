@@ -7,8 +7,21 @@ using Memento
 using DocStringExtensions
 using ProgressMeter
 
-# TODO: more reliable way to determine location for dependencies
-const dependencies_path = joinpath(@__DIR__, "..", "deps")
+function resolve_dependencies_path(;
+    env::AbstractDict = ENV,
+    package_root::Union{String,Nothing} = pkgdir(@__MODULE__),
+)::String
+    env_override = get(env, "MIPVERIFY_DEPS_PATH", "")
+    if !isempty(strip(env_override))
+        return abspath(env_override)
+    end
+    if package_root === nothing
+        return normpath(joinpath(@__DIR__, "..", "deps"))
+    end
+    return joinpath(package_root, "deps")
+end
+
+const dependencies_path = resolve_dependencies_path()
 
 export find_adversarial_example, frac_correct, interval_arithmetic, lp, mip
 
@@ -45,9 +58,14 @@ $(SIGNATURES)
 Perturbs `input` such that the network `nn` classifies the perturbed image in one of the categories
 identified by the indexes in `target_selection`.
 
-IMPORTANT: `target_selection` can include the correct label for `input`.
+IMPORTANT: 
+  1) `target_selection` can include the correct label for `input`.
+  2) It is possible (particularly with the `closest` objective) to see 'ties' -- that is, the
+     perturbed input produces an output with two logits (one corresponding to a target category,
+     and one corresponding to a non-target category) taking on the same maximal value. See the
+     formal definition below for more; in particular, note that '≥' sign.
 
-`optimizer` is used  build and solve the MIP problem.
+`optimizer` is used to build and solve the MIP problem.
 
 The output dictionary has keys `:Model, :PerturbationFamily, :TargetIndexes, :SolveStatus,
 :Perturbation, :PerturbedInput, :Output`. See the
@@ -87,6 +105,8 @@ that `y[j] - y[i] ≥ 0` for some `j ∈ target_selection` and for all `i ∉ ta
     MIP problem since we already have an "adversarial example" --- namely, the input itself. We
     continue build the model and solve the (trivial) MIP problem if and only if
     `solve_if_predicted_in_targeted` is `true`.
+- `margin`: Defaults to `0.0`. If specified, the target category must have logits strictly larger
+    (by at least `margin`) than any non-target category. 
 """
 function find_adversarial_example(
     nn::NeuralNet,
@@ -101,6 +121,7 @@ function find_adversarial_example(
     tightening_algorithm::TighteningAlgorithm = DEFAULT_TIGHTENING_ALGORITHM,
     tightening_options::Dict = get_default_tightening_options(optimizer),
     solve_if_predicted_in_targeted = true,
+    margin::Real = 0.0,
 )::Dict
 
     total_time = @elapsed begin
@@ -130,7 +151,7 @@ function find_adversarial_example(
             m = d[:Model]
 
             if adversarial_example_objective == closest
-                set_max_indexes(m, d[:Output], d[:TargetIndexes])
+                set_max_indexes(m, d[:Output], d[:TargetIndexes], margin = margin)
 
                 # Set perturbation objective
                 # NOTE (vtjeng): It is important to set the objective immediately before we carry
@@ -147,7 +168,10 @@ function find_adversarial_example(
                 # details.
                 v_obj = @variable(m)
                 @constraint(m, v_obj == maximum_target_var - maximum_nontarget_var)
-                @constraint(m, v_obj >= 0)
+                # JuMP does not support strict inequalities; see 
+                # https://github.com/jump-dev/JuMP.jl/blob/24c0409c5fa5cae6a4ae64b1c82ab5f83d55fbc6/src/macros/%40variable.jl#L516-L523
+                # for more context.
+                @constraint(m, v_obj >= margin)
                 @objective(m, Max, v_obj)
             else
                 error("Unknown adversarial_example_objective $adversarial_example_objective")
@@ -168,8 +192,22 @@ function get_label(y::Array{<:Real,1}, test_index::Integer)::Int
     return y[test_index]
 end
 
+function get_label(
+    dataset::LabelledImageDataset{T,U},
+    test_index::Integer,
+)::Int where {T<:Real,U<:Integer}
+    return get_label(dataset.labels, test_index)
+end
+
 function get_image(x::Array{T,4}, test_index::Integer)::Array{T,4} where {T<:Real}
     return x[test_index:test_index, :, :, :]
+end
+
+function get_image(
+    dataset::LabelledImageDataset{T,U},
+    test_index::Integer,
+)::Array{T,4} where {T<:Real,U<:Integer}
+    return get_image(dataset.images, test_index)
 end
 
 """
@@ -190,8 +228,8 @@ function frac_correct(nn::NeuralNet, dataset::LabelledDataset, num_samples::Inte
     num_samples = min(num_samples, MIPVerify.num_samples(dataset))
     p = Progress(num_samples, desc = "Computing fraction correct...", enabled = isinteractive())
     for sample_index in 1:num_samples
-        input = get_image(dataset.images, sample_index)
-        actual_label = get_label(dataset.labels, sample_index)
+        input = get_image(dataset, sample_index)
+        actual_label = get_label(dataset, sample_index)
         predicted_label = (input |> nn |> get_max_index) - 1
         if actual_label == predicted_label
             num_correct += 1

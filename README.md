@@ -1,6 +1,6 @@
 # MIPVerify.jl
 
-[![CI](https://github.com/vtjeng/MIPVerify.jl/workflows/CI/badge.svg)](https://github.com/vtjeng/MIPVerify.jl/actions?query=workflow%3ACI+branch%3Amaster)
+[![CI](https://github.com/vtjeng/MIPVerify.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/vtjeng/MIPVerify.jl/actions?query=workflow%3ACI+branch%3Amaster)
 [![PkgEval][pkgeval-img]][pkgeval-url]
 [![code coverage](https://codecov.io/gh/vtjeng/MIPVerify.jl/branch/master/graph/badge.svg)](http://codecov.io/github/vtjeng/MIPVerify.jl?branch=master)
 [![docs: stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://vtjeng.github.io/MIPVerify.jl/stable)
@@ -91,6 +91,12 @@ reached the time limit for some samples. Error is over the full MNIST test set o
 \^ Values in this column represent previous state-of-the-art (SOA), as described in our
 paper.<br> \* Neural network available for import via listed name using
 `get_example_network_params`.
+
+## Benchmarks
+
+Historical benchmark results are tracked on the
+[`benchmark-results`](https://github.com/vtjeng/MIPVerify.jl/tree/benchmark-results) branch, updated
+nightly by CI. See [`benchmarks/README.md`](./benchmarks/README.md) for details.
 
 ## Contributing
 

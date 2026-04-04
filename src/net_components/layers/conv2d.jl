@@ -21,6 +21,23 @@ Represents 2-D convolution operation.
 `p(x)` is shorthand for [`conv2d(x, p)`](@ref) when `p` is an instance of
 `Conv2d`.
 
+## Dimension conventions (TensorFlow-style NHWC/HWIO):
+
+This follows the conventions of
+[`tf.nn.conv2d`](https://www.tensorflow.org/api_docs/python/tf/nn/conv2d):
+
+- **Input**: `(batch, height, width, in_channels)` — NHWC format,
+  matching TensorFlow's default `data_format="NHWC"`
+- **Filter**: `(filter_height, filter_width, in_channels, out_channels)` — HWIO format,
+  matching TensorFlow's filter shape for `tf.nn.conv2d`
+- **Output**: `(batch, out_height, out_width, out_channels)` — NHWC format
+
+To convert from PyTorch (OIHW filters, NCHW inputs), use
+[`convert_conv_filter_from_pytorch`](@ref) and [`convert_images_from_pytorch`](@ref).
+
+To convert from Flux.jl (WHIO filters, WHCN inputs), use
+[`convert_conv_filter_from_flux`](@ref) and [`convert_images_from_flux`](@ref).
+
 ## Fields:
 $(FIELDS)
 """
@@ -95,14 +112,13 @@ function Base.show(io::IO, p::Conv2d)
     )
 end
 
-# TODO (vtjeng): Figure out how to actually mutate the underlying value of s
-# OR avoid all this confusion
-function add_to_expression!(s::Real, input_val::Real, filter_val::Real)
+function accumulate_expression(s::Real, input_val::Real, filter_val::Real)
     return s + input_val * filter_val
 end
 
-function add_to_expression!(s::JuMP.GenericAffExpr, input_val, filter_val)
-    return JuMP.add_to_expression!(s, input_val, filter_val)
+function accumulate_expression(s::JuMP.GenericAffExpr, input_val, filter_val)
+    JuMP.add_to_expression!(s, input_val, filter_val)
+    return s
 end
 
 function compute_output_parameters(
@@ -175,16 +191,22 @@ $(SIGNATURES)
 
 Computes the result of convolving `input` with the `filter` and `bias` stored in `params`.
 
-Mirrors `tf.nn.conv2d` from the `tensorflow` package, with
-`strides = [1, params.stride, params.stride, 1]`.
+Mirrors [`tf.nn.conv2d`](https://www.tensorflow.org/api_docs/python/tf/nn/conv2d)
+from TensorFlow, with `strides = [1, params.stride, params.stride, 1]`.
 
-Supports three types of padding:
-- 'same':  Specify via `SamePadding()`. Padding is added so that the output has the same size as the input.
-- 'valid': Specify via `FixedPadding()`. No padding is added.
-- 'fixed': Specify via:
+## Dimension conventions:
+- **Input**: `(batch, height, width, in_channels)` — NHWC format
+- **Filter**: `(filter_height, filter_width, in_channels, out_channels)` — HWIO format
+- **Output**: `(batch, out_height, out_width, out_channels)` — NHWC format
+
+## Padding:
+- `SamePadding()`: TensorFlow-style `SAME` padding is used, so output spatial size is
+  `(ceil(input_height / stride), ceil(input_width / stride))`.
+- `ValidPadding()`: No padding is added.
+- Fixed padding, specified as:
   - A single integer, interpreted as padding for both axes
-  - A tuple of two integers, interpreted as (y_padding, x_padding)
-  - A tuple of four integers, interpreted as (top, bottom, left, right)
+  - A tuple of two integers, interpreted as `(y_padding, x_padding)`
+  - A tuple of four integers, interpreted as `(top, bottom, left, right)`
 
 # Throws
 * AssertionError if `input` and `filter` are not compatible.
@@ -222,7 +244,7 @@ function conv2d(input::Array{T,4}, params::Conv2d{U,V}) where {T<:JuMPReal,U<:Ju
             input_index = (i_1, x, y, j_3)
             if checkbounds(Bool, input, input_index...)
                 # Effectively zero-padding the input.
-                (@nref 4 output i) = add_to_expression!(
+                (@nref 4 output i) = accumulate_expression(
                     (@nref 4 output i),
                     input[input_index...],
                     filter[j_1, j_2, j_3, i_4],

@@ -22,13 +22,29 @@ end
 
 function extract_results_for_save(d::Dict)::Dict
     m = d[:Model]
+    status = d[:SolveStatus]
     r = Dict()
     r[:SolveTime] = d[:SolveTime]
-    if !is_infeasible(d[:SolveStatus])
-        r[:ObjectiveBound] = JuMP.objective_bound(m)
-        r[:ObjectiveValue] = JuMP.objective_value(m)
+    if !is_infeasible(status) && JuMP.has_values(m)
+        r[:ObjectiveBound] = try
+            JuMP.objective_bound(m)
+        catch
+            NaN
+        end
+        r[:ObjectiveValue] = try
+            JuMP.objective_value(m)
+        catch
+            NaN
+        end
         r[:PerturbationValue] = d[:Perturbation] .|> JuMP.value
         r[:PerturbedInputValue] = d[:PerturbedInput] .|> JuMP.value
+    elseif !is_infeasible(status)
+        r[:ObjectiveBound] = try
+            JuMP.objective_bound(m)
+        catch
+            NaN
+        end
+        r[:ObjectiveValue] = NaN
     else
         r[:ObjectiveBound] = NaN
         r[:ObjectiveValue] = NaN
@@ -277,10 +293,9 @@ function batch_find_untargeted_attack(
     for sample_number in target_indices
         should_run = run_on_sample_for_untargeted_attack(sample_number, dt, solve_rerun_option)
         if should_run
-            # TODO (vtjeng): change function signature for get_image and get_label
             Memento.info(MIPVerify.LOGGER, "Working on index $(sample_number)")
-            input = MIPVerify.get_image(dataset.images, sample_number)
-            true_one_indexed_label = MIPVerify.get_label(dataset.labels, sample_number) + 1
+            input = MIPVerify.get_image(dataset, sample_number)
+            true_one_indexed_label = MIPVerify.get_label(dataset, sample_number) + 1
             d = find_adversarial_example(
                 nn,
                 input,
@@ -394,8 +409,8 @@ function batch_find_targeted_attack(
                 solve_rerun_option,
             )
             if should_run
-                input = MIPVerify.get_image(dataset.images, sample_number)
-                true_one_indexed_label = MIPVerify.get_label(dataset.labels, sample_number) + 1
+                input = MIPVerify.get_image(dataset, sample_number)
+                true_one_indexed_label = MIPVerify.get_label(dataset, sample_number) + 1
                 if true_one_indexed_label == target_label
                     continue
                 end

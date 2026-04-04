@@ -10,8 +10,11 @@ abstract type LabelledDataset <: Dataset end
 $(TYPEDEF)
 
 Dataset of images stored as a 4-dimensional array of size `(num_samples, image_height,
-image_width, num_channels)`, with accompanying labels (sorted in the same order) of size
-`num_samples`.
+image_width, num_channels)` — NHWC format — with accompanying labels (sorted in the same
+order) of size `num_samples`.
+
+To convert from PyTorch's NCHW format, use [`convert_images_from_pytorch`](@ref).
+To convert from Flux.jl's WHCN format, use [`convert_images_from_flux`](@ref).
 """
 struct LabelledImageDataset{T<:Real,U<:Integer} <: LabelledDataset
     images::Array{T,4}
@@ -76,7 +79,11 @@ struct NamedTrainTestDataset{T<:Dataset,U<:Dataset} <: Dataset
     Test set.
     """
     test::U
-    # TODO (vtjeng): train and test should be the same type of struct (but might potentially have different parameters).
+
+    function NamedTrainTestDataset(name::String, train::T, test::U) where {T<:Dataset,U<:Dataset}
+        @assert Base.typename(T) === Base.typename(U) "Train and test datasets must be the same struct type. Got $(T) and $(U)."
+        return new{T,U}(name, train, test)
+    end
 end
 
 function Base.show(io::IO, dataset::NamedTrainTestDataset)
