@@ -198,13 +198,26 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         l = lower_bound(x)
     end
 
-    # Tighten N2 bounds using derived N1 + diff bounds
-    if tighten_n2_bounds && (network_version == "n2_org" || network_version == "n2_pert")
+    # Tighten N2(x) bounds using derived N1 + diff bounds
+    if bound_n2_relu_using_zonotope && (network_version == "n2_org" || network_version == "n2_pert")
         m_idx = layer_counter
         k_idx = neurons_names.neuron
         if m_idx >= 1 && m_idx <= length(n2_derived_preact_up_bounds) && k_idx >= 1 && k_idx <= length(n2_derived_preact_up_bounds[m_idx])
             u_derived = n2_derived_preact_up_bounds[m_idx][k_idx]
             l_derived = n2_derived_preact_down_bounds[m_idx][k_idx]
+            u = min(u, u_derived)
+            l = max(l, l_derived)
+        end
+    end
+
+    # Tighten N2(x') bounds using N1 preact + composed bounds
+    if bound_n2_xp_using_composed && network_version == "n2_pert"
+        m_idx = layer_counter
+        k_idx = neurons_names.neuron
+        if !isempty(n2_xp_derived_preact_up_bounds) && m_idx >= 1 && m_idx <= length(n2_xp_derived_preact_up_bounds) &&
+           k_idx >= 1 && k_idx <= length(n2_xp_derived_preact_up_bounds[m_idx])
+            u_derived = n2_xp_derived_preact_up_bounds[m_idx][k_idx]
+            l_derived = n2_xp_derived_preact_down_bounds[m_idx][k_idx]
             u = min(u, u_derived)
             l = max(l, l_derived)
         end
@@ -428,6 +441,36 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
             end
         end
 
+        # ── Transfer-aware: replace N2 binary with triangle relaxation when N1 neuron is stable ──
+        # If N1's corresponding neuron has a known activation status (always active or
+        # always inactive), N2's activation is tightly constrained by the diff bounds.
+        # We can replace N2's binary variable with a triangle LP relaxation — sound
+        # (delta_diff >= exact) and tight when diff bounds are narrow.
+        # Standard mode cannot do this (no reference network).
+        if n1_stability_relax_threshold >= 0 && (network_version == "n2_org" || network_version == "n2_pert")
+            m_idx = layer_counter
+            k_idx = neurons_names.neuron
+            if !isempty(n1_preact_up_bounds) && m_idx >= 1 && m_idx <= length(n1_preact_up_bounds) &&
+               k_idx >= 1 && k_idx <= length(n1_preact_up_bounds[m_idx])
+                n1_l = n1_preact_down_bounds[m_idx][k_idx]
+                n1_u = n1_preact_up_bounds[m_idx][k_idx]
+                n1_is_stable = (n1_l >= 0.0) || (n1_u <= 0.0)
+                if n1_is_stable
+                    tri_gap = _tri_gap(l, u)
+                    if tri_gap <= n1_stability_relax_threshold
+                        # Triangle LP relaxation (no binary variable)
+                        x_rect = @variable(model, lower_bound = 0, upper_bound = u)
+                        @constraint(model, x_rect >= x)
+                        @constraint(model, x_rect <= u / (u - l) * x - u * l / (u - l))
+                        set_name(x_rect, string(network_version, "x_rect_n1stab_", "layerCount", layer_counter,
+                            "_neuronCount", nueron_counter, "_", neurons_names.layer, "_", neurons_names.neuron))
+                        global relaxation_condition_count += 1
+                        return x_rect
+                    end
+                end
+            end
+        end
+
         # ── Standard exact ReLU encoding (binary variable) ───────────────────
         av = JuMP.all_variables(model)
         push!(layers_info_dict,(neurons_names.layer,neurons_names.neuron)=>(u,l,length(av)))
@@ -449,6 +492,58 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         @constraint(model, x_rect >= x)
         @constraint(model, x_rect <= u * a)
         @constraint(model, x_rect >= 0)
+
+        # ── Cross-copy linking: conditional constraints using N2(x)'s binary ──
+        # Links N2(x') post-ReLU to N2(x)'s activation via perturbation bounds
+        # derived through N1's zonotope. Sound: tightens LP relaxation without
+        # removing any binaries. Transfer-only (standard has no second copy).
+        if constrain_n2_xp_via_n1_zonotope && network_version == "n2_pert"
+            m_idx = layer_counter
+            k_idx = neurons_names.neuron
+            # Look up N2(x)'s binary variable by name
+            a_pre_name = string("n2_org", "a", "_", "layerCount", layer_counter,
+                "_", "neuronCount", nueron_counter, "_",
+                string(neurons_names.layer), "_", string(neurons_names.neuron))
+            a_pre = variable_by_name(model, a_pre_name)
+            if a_pre !== nothing &&
+               !isempty(relu_n2pert_up_bounds) && m_idx >= 1 && m_idx <= length(relu_n2pert_up_bounds) &&
+               k_idx >= 1 && k_idx <= length(relu_n2pert_up_bounds[m_idx]) &&
+               !isempty(n2_preact_up_bounds) && m_idx <= length(n2_preact_up_bounds)
+                # Perturbation interval: N2(x') - N2(x)
+                u_int = relu_n2pert_up_bounds[m_idx][k_idx]
+                l_int = relu_n2pert_down_bounds[m_idx][k_idx]
+                # Tighter bounds via N1: composed - diff
+                if !isempty(relu_comp_up_bounds) && m_idx <= length(relu_comp_up_bounds) &&
+                   !isempty(relu_diff_up_bounds) && m_idx <= length(relu_diff_up_bounds)
+                    u_int_n1 = relu_comp_up_bounds[m_idx][k_idx] - relu_diff_down_bounds[m_idx][k_idx]
+                    l_int_n1 = relu_comp_down_bounds[m_idx][k_idx] - relu_diff_up_bounds[m_idx][k_idx]
+                    u_int = min(u_int, u_int_n1)
+                    l_int = max(l_int, l_int_n1)
+                end
+                u_pre = n2_preact_up_bounds[m_idx][k_idx]
+                l_pre = n2_preact_down_bounds[m_idx][k_idx]
+                # Conditional intervals: N2(x') preact given N2(x) activation
+                lA = l_int;          uA = u_pre + u_int   # N2(x) active
+                lI = l_pre + l_int;  uI = u_int           # N2(x) inactive
+                M_val = u + (-l)
+                # Active-case upper bound (a_pre=1 → tight, a_pre=0 → slack)
+                if lA >= 0.0
+                    @constraint(model, x_rect <= x + M_val * (1 - a_pre))
+                elseif uA <= 0.0
+                    @constraint(model, x_rect <= M_val * (1 - a_pre))
+                elseif uA > 0.0
+                    @constraint(model, x_rect <= (uA / (uA - lA)) * (x - lA) + M_val * (1 - a_pre))
+                end
+                # Inactive-case upper bound (a_pre=0 → tight, a_pre=1 → slack)
+                if lI >= 0.0
+                    @constraint(model, x_rect <= x + M_val * a_pre)
+                elseif uI <= 0.0
+                    @constraint(model, x_rect <= M_val * a_pre)
+                elseif uI > 0.0
+                    @constraint(model, x_rect <= (uI / (uI - lI)) * (x - lI) + M_val * a_pre)
+                end
+            end
+        end
 
         # Manually set the bounds for x_rect so they can be used by downstream operations.
         set_lower_bound(x_rect, 0)
