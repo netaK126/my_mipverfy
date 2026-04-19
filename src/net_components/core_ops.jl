@@ -223,6 +223,71 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         end
     end
 
+    # ── Advanced-standard: tighten N2 bounds using N1 + diff bounds ─────
+    # After solving N1's standard MIP, we have N1's pre-activation bounds
+    # in n1_neuron_bounds. Combined with diff bounds from
+    # compute_diff_and_comp_bounds(nn1, nn2, ...), we derive tighter N2 bounds:
+    #   z_N2_pre ∈ [l_N1 + diff_down, u_N1 + diff_up]
+    # Sound by interval arithmetic (see plan for full proof).
+    # These tighter bounds may eliminate binary variables when a split neuron
+    # becomes provably stable (u_tight <= 0 or l_tight >= 0).
+    if !isempty(n1_neuron_bounds) && (network_version == "org" || network_version == "perturbation")
+        key = (neurons_names.layer, neurons_names.neuron)
+        if haskey(n1_neuron_bounds, key)
+            (n1_u, n1_l) = n1_neuron_bounds[key]
+            m_idx = layer_counter
+            k_idx = neurons_names.neuron
+            if !isempty(relu_diff_up_bounds) && m_idx >= 1 && m_idx <= length(relu_diff_up_bounds) &&
+               k_idx >= 1 && k_idx <= length(relu_diff_up_bounds[m_idx])
+                diff_up_val = relu_diff_up_bounds[m_idx][k_idx]
+                diff_down_val = relu_diff_down_bounds[m_idx][k_idx]
+                u_tight = n1_u + diff_up_val
+                l_tight = n1_l + diff_down_val
+                u = min(u, u_tight)
+                l = max(l, l_tight)
+            end
+        end
+    end
+
+    # ── Source B: absolute N2 zonotope with per-layer N1 tightening ─────
+    # Populated by compute_n2_bounds_zonotope_with_n1_tighten when
+    # --adv_std_zono_bounds is active. Empty otherwise, so this block is a
+    # no-op in the default path. Sound as an over-approximation of N2's
+    # value set; intersection with the existing [l, u] preserves feasibility.
+    if !isempty(n2_abs_up_bounds) && (network_version == "org" || network_version == "perturbation")
+        m_idx = layer_counter
+        k_idx = neurons_names.neuron
+        if m_idx >= 1 && m_idx <= length(n2_abs_up_bounds) &&
+           k_idx >= 1 && k_idx <= length(n2_abs_up_bounds[m_idx])
+            u = min(u, n2_abs_up_bounds[m_idx][k_idx])
+            l = max(l, n2_abs_down_bounds[m_idx][k_idx])
+        end
+    end
+
+    # ── Source C: N1-probe LP bounds (--adv_std_n1_probe=lp) ────────────
+    # Populated by compute_n2_bounds_n1_probe_lp via per-neuron OBBT on a
+    # joint LP-relaxed (N1 + N2) model. Two separate arrays because the
+    # probe runs independently for the clean-input ("org") and perturbed-
+    # input ("perturbation") network_version passes. Empty by default;
+    # block is a no-op when the flag is off.
+    if network_version == "org" && !isempty(n2_probe_up_bounds_org)
+        m_idx = layer_counter
+        k_idx = neurons_names.neuron
+        if m_idx >= 1 && m_idx <= length(n2_probe_up_bounds_org) &&
+           k_idx >= 1 && k_idx <= length(n2_probe_up_bounds_org[m_idx])
+            u = min(u, n2_probe_up_bounds_org[m_idx][k_idx])
+            l = max(l, n2_probe_down_bounds_org[m_idx][k_idx])
+        end
+    elseif network_version == "perturbation" && !isempty(n2_probe_up_bounds_pert)
+        m_idx = layer_counter
+        k_idx = neurons_names.neuron
+        if m_idx >= 1 && m_idx <= length(n2_probe_up_bounds_pert) &&
+           k_idx >= 1 && k_idx <= length(n2_probe_up_bounds_pert[m_idx])
+            u = min(u, n2_probe_up_bounds_pert[m_idx][k_idx])
+            l = max(l, n2_probe_down_bounds_pert[m_idx][k_idx])
+        end
+    end
+
     if u <= 0
         # rectified value is always 0
         return zero(T)
@@ -467,6 +532,45 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
                         global relaxation_condition_count += 1
                         return x_rect
                     end
+                end
+            end
+        end
+
+        # ── advstd Technique 6: N1-gated N2/N2p triangle LP relaxation ───────
+        # When --adv_std_n2_relax_threshold >= 0 and the triangle-gap-area
+        # normalized measure of N1's interval at the corresponding neuron is
+        # below the threshold, replace the big-M binary encoding of this
+        # N2/N2p ReLU with a pure LP triangle relaxation. Sound as an
+        # over-approximation: delta_relaxed >= delta_exact, and every concrete
+        # feasible (x, z_N2) continues to satisfy the three triangle
+        # inequalities. `_tri_gap` is the closure defined ~line 284 above.
+        if adv_std_n2_relax_threshold >= 0.0 &&
+           (network_version == "org" || network_version == "perturbation") &&
+           !isempty(n1_neuron_bounds)
+            key = (neurons_names.layer, neurons_names.neuron)
+            if haskey(n1_neuron_bounds, key)
+                (n1_u_val, n1_l_val) = n1_neuron_bounds[key]
+                n1_score = _tri_gap(n1_l_val, n1_u_val)
+                if n1_score <= adv_std_n2_relax_threshold
+                    av = JuMP.all_variables(model)
+                    push!(layers_info_dict,
+                          (neurons_names.layer, neurons_names.neuron) => (u, l, length(av)))
+                    x_rect = @variable(model)
+                    set_lower_bound(x_rect, 0.0)
+                    set_upper_bound(x_rect, max(0.0, u))
+                    set_name(x_rect, string(network_version, "x_rect_n1relax_advstd_",
+                                            "layerCount", layer_counter,
+                                            "_neuronCount", nueron_counter,
+                                            "_", neurons_names.layer, "_", neurons_names.neuron))
+                    @constraint(model, x_rect >= 0)
+                    @constraint(model, x_rect >= x)
+                    @constraint(model, x_rect <= (u / (u - l)) * (x - l))
+                    if network_version == "org"
+                        global n_n2_relaxed_binaries_org += 1
+                    else
+                        global n_n2_relaxed_binaries_pert += 1
+                    end
+                    return x_rect
                 end
             end
         end
