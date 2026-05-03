@@ -180,11 +180,76 @@ function relu(x::AbstractArray{T}) where {T<:Real}
     return relu.(x)
 end
 
+# Triangle LP relaxation gap-area for a split ReLU on [l, u].
+# 0 when the neuron is stable (single-signed interval); else u * |l| / (2 * (u - l)).
+# Defined at module scope so compute_n2_relax_decision! can reuse it — the
+# closure of the same name inside relu() matches this definition exactly.
+_tri_gap(l_val::Real, u_val::Real) =
+    (l_val >= 0.0 || u_val <= 0.0) ? 0.0 : u_val * (-l_val) / (2.0 * (u_val - l_val))
+
+# Shared helper: intersect per-copy N2 bounds from advstd Sources A/B/C.
+# Called from both relu() (where the intersected (l, u) is used to emit
+# either the exact big-M or a triangle relaxation) and from
+# compute_n2_relax_decision! (where the same intersected bounds decide
+# whether to relax each copy). Keeping the two sites in sync is the
+# load-bearing invariant for the soundness of Technique 6 (tiered
+# BoundTightPertRelax): the triangle is emitted on the exact interval
+# the decision evaluated, so any (ẑ, z⁺) feasible under the exact ReLU
+# on that interval is also feasible under the triangle.
+function intersect_per_copy_bounds(
+    l_init::Real, u_init::Real,
+    nn_layer::Int, nn_neuron::Int,
+    m_idx::Int, k_idx::Int,
+    version::AbstractString,
+)::Tuple{Float64,Float64}
+    l = Float64(l_init)
+    u = Float64(u_init)
+
+    # Source A: N1 neuron bounds + diff bounds
+    if !isempty(n1_neuron_bounds) && (version == "org" || version == "perturbation")
+        key = (nn_layer, nn_neuron)
+        if haskey(n1_neuron_bounds, key)
+            (n1_u, n1_l) = n1_neuron_bounds[key]
+            if !isempty(relu_diff_up_bounds) && m_idx >= 1 && m_idx <= length(relu_diff_up_bounds) &&
+               k_idx >= 1 && k_idx <= length(relu_diff_up_bounds[m_idx])
+                u = min(u, n1_u + relu_diff_up_bounds[m_idx][k_idx])
+                l = max(l, n1_l + relu_diff_down_bounds[m_idx][k_idx])
+            end
+        end
+    end
+
+    # Source B: absolute N2 zonotope (merged across copies)
+    if !isempty(n2_abs_up_bounds) && (version == "org" || version == "perturbation")
+        if m_idx >= 1 && m_idx <= length(n2_abs_up_bounds) &&
+           k_idx >= 1 && k_idx <= length(n2_abs_up_bounds[m_idx])
+            u = min(u, n2_abs_up_bounds[m_idx][k_idx])
+            l = max(l, n2_abs_down_bounds[m_idx][k_idx])
+        end
+    end
+
+    # Source C: N1-probe LP (per-copy)
+    if version == "org" && !isempty(n2_probe_up_bounds_org)
+        if m_idx >= 1 && m_idx <= length(n2_probe_up_bounds_org) &&
+           k_idx >= 1 && k_idx <= length(n2_probe_up_bounds_org[m_idx])
+            u = min(u, n2_probe_up_bounds_org[m_idx][k_idx])
+            l = max(l, n2_probe_down_bounds_org[m_idx][k_idx])
+        end
+    elseif version == "perturbation" && !isempty(n2_probe_up_bounds_pert)
+        if m_idx >= 1 && m_idx <= length(n2_probe_up_bounds_pert) &&
+           k_idx >= 1 && k_idx <= length(n2_probe_up_bounds_pert[m_idx])
+            u = min(u, n2_probe_up_bounds_pert[m_idx][k_idx])
+            l = max(l, n2_probe_down_bounds_pert[m_idx][k_idx])
+        end
+    end
+
+    return (l, u)
+end
+
 function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
     global network_version
     global layer_counter
     global nueron_counter
-    
+
     neurons_names.neuron += 1
 
     if u < l
@@ -223,69 +288,17 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         end
     end
 
-    # ── Advanced-standard: tighten N2 bounds using N1 + diff bounds ─────
-    # After solving N1's standard MIP, we have N1's pre-activation bounds
-    # in n1_neuron_bounds. Combined with diff bounds from
-    # compute_diff_and_comp_bounds(nn1, nn2, ...), we derive tighter N2 bounds:
-    #   z_N2_pre ∈ [l_N1 + diff_down, u_N1 + diff_up]
-    # Sound by interval arithmetic (see plan for full proof).
-    # These tighter bounds may eliminate binary variables when a split neuron
-    # becomes provably stable (u_tight <= 0 or l_tight >= 0).
-    if !isempty(n1_neuron_bounds) && (network_version == "org" || network_version == "perturbation")
-        key = (neurons_names.layer, neurons_names.neuron)
-        if haskey(n1_neuron_bounds, key)
-            (n1_u, n1_l) = n1_neuron_bounds[key]
-            m_idx = layer_counter
-            k_idx = neurons_names.neuron
-            if !isempty(relu_diff_up_bounds) && m_idx >= 1 && m_idx <= length(relu_diff_up_bounds) &&
-               k_idx >= 1 && k_idx <= length(relu_diff_up_bounds[m_idx])
-                diff_up_val = relu_diff_up_bounds[m_idx][k_idx]
-                diff_down_val = relu_diff_down_bounds[m_idx][k_idx]
-                u_tight = n1_u + diff_up_val
-                l_tight = n1_l + diff_down_val
-                u = min(u, u_tight)
-                l = max(l, l_tight)
-            end
-        end
-    end
-
-    # ── Source B: absolute N2 zonotope with per-layer N1 tightening ─────
-    # Populated by compute_n2_bounds_zonotope_with_n1_tighten when
-    # --adv_std_zono_bounds is active. Empty otherwise, so this block is a
-    # no-op in the default path. Sound as an over-approximation of N2's
-    # value set; intersection with the existing [l, u] preserves feasibility.
-    if !isempty(n2_abs_up_bounds) && (network_version == "org" || network_version == "perturbation")
-        m_idx = layer_counter
-        k_idx = neurons_names.neuron
-        if m_idx >= 1 && m_idx <= length(n2_abs_up_bounds) &&
-           k_idx >= 1 && k_idx <= length(n2_abs_up_bounds[m_idx])
-            u = min(u, n2_abs_up_bounds[m_idx][k_idx])
-            l = max(l, n2_abs_down_bounds[m_idx][k_idx])
-        end
-    end
-
-    # ── Source C: N1-probe LP bounds (--adv_std_n1_probe=lp) ────────────
-    # Populated by compute_n2_bounds_n1_probe_lp via per-neuron OBBT on a
-    # joint LP-relaxed (N1 + N2) model. Two separate arrays because the
-    # probe runs independently for the clean-input ("org") and perturbed-
-    # input ("perturbation") network_version passes. Empty by default;
-    # block is a no-op when the flag is off.
-    if network_version == "org" && !isempty(n2_probe_up_bounds_org)
-        m_idx = layer_counter
-        k_idx = neurons_names.neuron
-        if m_idx >= 1 && m_idx <= length(n2_probe_up_bounds_org) &&
-           k_idx >= 1 && k_idx <= length(n2_probe_up_bounds_org[m_idx])
-            u = min(u, n2_probe_up_bounds_org[m_idx][k_idx])
-            l = max(l, n2_probe_down_bounds_org[m_idx][k_idx])
-        end
-    elseif network_version == "perturbation" && !isempty(n2_probe_up_bounds_pert)
-        m_idx = layer_counter
-        k_idx = neurons_names.neuron
-        if m_idx >= 1 && m_idx <= length(n2_probe_up_bounds_pert) &&
-           k_idx >= 1 && k_idx <= length(n2_probe_up_bounds_pert[m_idx])
-            u = min(u, n2_probe_up_bounds_pert[m_idx][k_idx])
-            l = max(l, n2_probe_down_bounds_pert[m_idx][k_idx])
-        end
+    # ── advstd Sources A (N1+diff), B (abs zono), C (N1-probe) ──────────
+    # Routed through intersect_per_copy_bounds so that Technique 6's
+    # compute_n2_relax_decision! sees exactly the same (l, u) the MIP
+    # actually uses for the encoding of this neuron (soundness invariant).
+    if network_version == "org" || network_version == "perturbation"
+        (l, u) = intersect_per_copy_bounds(
+            l, u,
+            neurons_names.layer, neurons_names.neuron,
+            layer_counter, neurons_names.neuron,
+            network_version,
+        )
     end
 
     if u <= 0
@@ -536,29 +549,31 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
             end
         end
 
-        # ── advstd Technique 6: N1-gated N2/N2p triangle LP relaxation ───────
-        # When --adv_std_n2_relax_threshold >= 0 and the triangle-gap-area
-        # normalized measure of N1's interval at the corresponding neuron is
-        # below the threshold, replace the big-M binary encoding of this
-        # N2/N2p ReLU with a pure LP triangle relaxation. Sound as an
-        # over-approximation: delta_relaxed >= delta_exact, and every concrete
-        # feasible (x, z_N2) continues to satisfy the three triangle
-        # inequalities. `_tri_gap` is the closure defined ~line 284 above.
+        # ── advstd Technique 6 (BoundTightPertRelax): tiered per-copy N2 relaxation ──
+        # Decision dict n2_relax_decision is precomputed by
+        # compute_n2_relax_decision! (run.jl) using N2's per-copy final
+        # tightened bounds. Tiered rule:
+        #   max(g_org, g_pert) ≤ τ → relax both copies
+        #   min(g_org, g_pert) ≤ τ → relax only the smaller-gap copy
+        #   else                   → keep both exact
+        # Sound: the emitted triangle uses the same (l, u) as the exact
+        # encoding would, so every x ∈ F_exact remains feasible here; hence
+        # δ_BTPR ≥ δ_exact (see §4 of advstd_techniques.tex).
         if adv_std_n2_relax_threshold >= 0.0 &&
            (network_version == "org" || network_version == "perturbation") &&
-           !isempty(n1_neuron_bounds)
+           !isempty(n2_relax_decision)
             key = (neurons_names.layer, neurons_names.neuron)
-            if haskey(n1_neuron_bounds, key)
-                (n1_u_val, n1_l_val) = n1_neuron_bounds[key]
-                n1_score = _tri_gap(n1_l_val, n1_u_val)
-                if n1_score <= adv_std_n2_relax_threshold
+            if haskey(n2_relax_decision, key)
+                (relax_org, relax_pert) = n2_relax_decision[key]
+                should_relax = (network_version == "org") ? relax_org : relax_pert
+                if should_relax
                     av = JuMP.all_variables(model)
                     push!(layers_info_dict,
                           (neurons_names.layer, neurons_names.neuron) => (u, l, length(av)))
                     x_rect = @variable(model)
                     set_lower_bound(x_rect, 0.0)
                     set_upper_bound(x_rect, max(0.0, u))
-                    set_name(x_rect, string(network_version, "x_rect_n1relax_advstd_",
+                    set_name(x_rect, string(network_version, "x_rect_btpr_advstd_",
                                             "layerCount", layer_counter,
                                             "_neuronCount", nueron_counter,
                                             "_", neurons_names.layer, "_", neurons_names.neuron))
