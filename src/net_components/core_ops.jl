@@ -585,6 +585,16 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
                     else
                         global n_n2_relaxed_binaries_pert += 1
                     end
+                    # Technique 4 (SibGate): record this neuron's MIP state
+                    # so the post-encoding pass can add the conditional
+                    # triangle (one-thin tier) or the pre-act coupling line
+                    # (both-thin tier) for it. Stored under (m_idx, k_idx,
+                    # network_version) where m_idx = layer_counter so the
+                    # post-pass can pair org with pert at the same neuron.
+                    if adv_std_n2_sibling_gate
+                        n2_relu_state[(layer_counter, neurons_names.neuron, network_version)] =
+                            (preact=x, l=l, u=u, x_rect=x_rect)
+                    end
                     return x_rect
                 end
             end
@@ -611,6 +621,16 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         @constraint(model, x_rect >= x)
         @constraint(model, x_rect <= u * a)
         @constraint(model, x_rect >= 0)
+
+        # Technique 4 (SibGate): record exact-encoded N2 sides too. The
+        # post-encoding pass needs the sibling's `x` (preact AffExpr) and
+        # (l, u) when the sibling is exact (e.g., one-thin tier where this
+        # copy keeps its binary while the other was dropped).
+        if adv_std_n2_sibling_gate &&
+           (network_version == "org" || network_version == "perturbation")
+            n2_relu_state[(layer_counter, neurons_names.neuron, network_version)] =
+                (preact=x, l=l, u=u, x_rect=x_rect)
+        end
 
         # ── Cross-copy linking: conditional constraints using N2(x)'s binary ──
         # Links N2(x') post-ReLU to N2(x)'s activation via perturbation bounds
