@@ -428,7 +428,6 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         if use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && (network_version == "n2_org" || network_version == "n2_pert" || network_version == "perturbation")
             m_idx = layer_counter         # ReLU layer index within current network (1-based, reset per pass)
             k_idx = neurons_names.neuron  # neuron index within the layer (1-based)
-            #NETA
             # Select the correct interval bounds for this pass
             # n2_org (transfer): diff bounds;  n2_pert / perturbation: composed/pert bounds
             bounds_up   = (network_version == "n2_org") ? relu_diff_up_bounds   : relu_comp_up_bounds
