@@ -180,22 +180,11 @@ function relu(x::AbstractArray{T}) where {T<:Real}
     return relu.(x)
 end
 
-# Triangle LP relaxation gap-area for a split ReLU on [l, u].
-# 0 when the neuron is stable (single-signed interval); else u * |l| / (2 * (u - l)).
-# Defined at module scope so compute_n2_relax_decision! can reuse it — the
-# closure of the same name inside relu() matches this definition exactly.
+# The triangle's gap area on [l, u] — the Conditional Triangle's tau score: 0 for a stable neuron, else u * |l| / (2 * (u - l)); compute_n2_relax_decision! scores every neuron with this.
 _tri_gap(l_val::Real, u_val::Real) =
     (l_val >= 0.0 || u_val <= 0.0) ? 0.0 : u_val * (-l_val) / (2.0 * (u_val - l_val))
 
-# Shared helper: intersect per-copy N2 bounds from advstd Sources A/B/C.
-# Called from both relu() (where the intersected (l, u) is used to emit
-# either the exact big-M or a triangle relaxation) and from
-# compute_n2_relax_decision! (where the same intersected bounds decide
-# whether to relax each copy). Keeping the two sites in sync is the
-# load-bearing invariant for the soundness of Technique 6 (tiered
-# BoundTightPertRelax): the triangle is emitted on the exact interval
-# the decision evaluated, so any (ẑ, z⁺) feasible under the exact ReLU
-# on that interval is also feasible under the triangle.
+# Shrink this neuron's range [l, u] using what transfer computed: N_pre's proven range for the matching neuron shifted by the difference bounds (how far N's value can be from N_pre's), and the zonotope's range. Both the MIP encoding and the Conditional Triangle's decision call this, so both see the exact same range.
 function intersect_per_copy_bounds(
     l_init::Real, u_init::Real,
     nn_layer::Int, nn_neuron::Int,
@@ -205,7 +194,7 @@ function intersect_per_copy_bounds(
     l = Float64(l_init)
     u = Float64(u_init)
 
-    # Source A: N1 neuron bounds + diff bounds
+    # N_pre's proven range for the matching neuron, shifted by the difference bounds [d_down, d_up].
     if !isempty(n1_neuron_bounds) && (version == "org" || version == "perturbation")
         key = (nn_layer, nn_neuron)
         if haskey(n1_neuron_bounds, key)
@@ -218,7 +207,7 @@ function intersect_per_copy_bounds(
         end
     end
 
-    # Source B: absolute N2 zonotope (merged across copies)
+    # The Zonotope Bound Tightening range (one zonotope over the whole input domain, covering both copies).
     if !isempty(n2_abs_up_bounds) && (version == "org" || version == "perturbation")
         if m_idx >= 1 && m_idx <= length(n2_abs_up_bounds) &&
            k_idx >= 1 && k_idx <= length(n2_abs_up_bounds[m_idx])
@@ -227,7 +216,7 @@ function intersect_per_copy_bounds(
         end
     end
 
-    # Source C: N1-probe LP (per-copy)
+    # Unreachable: retired probe bounds — the arrays below stay permanently empty.
     if version == "org" && !isempty(n2_probe_up_bounds_org)
         if m_idx >= 1 && m_idx <= length(n2_probe_up_bounds_org) &&
            k_idx >= 1 && k_idx <= length(n2_probe_up_bounds_org[m_idx])
@@ -263,7 +252,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         l = lower_bound(x)
     end
 
-    # Tighten N2(x) bounds using derived N1 + diff bounds
+    # Unreachable: retired transfer-mode branch (the "n2_org"/"n2_pert" copies are never built).
     if bound_n2_relu_using_zonotope && (network_version == "n2_org" || network_version == "n2_pert")
         m_idx = layer_counter
         k_idx = neurons_names.neuron
@@ -275,7 +264,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         end
     end
 
-    # Tighten N2(x') bounds using N1 preact + composed bounds
+    # Unreachable: retired transfer-mode branch (the "n2_pert" copy is never built).
     if bound_n2_xp_using_composed && network_version == "n2_pert"
         m_idx = layer_counter
         k_idx = neurons_names.neuron
@@ -288,10 +277,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         end
     end
 
-    # ── advstd Sources A (N1+diff), B (abs zono), C (N1-probe) ──────────
-    # Routed through intersect_per_copy_bounds so that Technique 6's
-    # compute_n2_relax_decision! sees exactly the same (l, u) the MIP
-    # actually uses for the encoding of this neuron (soundness invariant).
+    # Shrink this neuron's range with transfer's extra bounds — the same helper the Conditional Triangle's decision used, so decision and encoding agree.
     if network_version == "org" || network_version == "perturbation"
         (l, u) = intersect_per_copy_bounds(
             l, u,
@@ -317,13 +303,10 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
     else
         model = owner_model(x)
 
-        # Helper for triangle relaxation-gap area scoring (used by both relaxation paths)
+        # Local copy of the gap-area formula; only the retired branches below use it.
         _tri_gap(l_val, u_val) = (l_val >= 0.0 || u_val <= 0.0) ? 0.0 : u_val * (-l_val) / (2.0 * (u_val - l_val))
 
-        # ── N2-only perturbation relaxation (--no_n1_binaries_and_relaxtions_only_on_n2) ──
-        # Relax N2(x_p) by conditioning on N2(x) binary (a_n2_org) using
-        # perturbation bounds through N2 (z_n2_pert - z_n2_org).
-        # N2(x) stays exact; N1(x) is LP-relaxed (handled below in standard encoding).
+        # Unreachable: retired branch — its switch is permanently false.
         if no_n1_binaries_and_relaxtions_only_on_n2 && network_version == "n2_pert"
             m_idx = layer_counter
             k_idx = neurons_names.neuron
@@ -403,28 +386,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
             end
         end
 
-        # ── Conditional-triangle relaxations (n2_org and n2_pert passes) ────────
-        # BRIDGE paper Section 5, eqs. (4) and (6).
-        #
-        # Both relaxations condition on a_n1_org (Npre's binary) and use Npre's
-        # pre-activation bounds [l_pre, u_pre].  They differ only in which
-        # interval bounds are used:
-        #
-        #   n2_org (activation relaxation, eq. 4):
-        #     interval = diff bounds [l_diff, u_diff] = z_n2_org - z_n1_org
-        #     threshold: u_diff - l_diff < T_relax
-        #
-        #   n2_pert (perturbation relaxation, eq. 6):
-        #     interval = composed bounds [l_comp, u_comp] = diff + pert
-        #                                               = z_n2_pert - z_n1_org
-        #     threshold: u_comp - l_comp < T_relax
-        #
-        # Conditional intervals (same formula for both, with their respective bounds):
-        #   Active   (a_n1_org=1): zˆ ∈ [l_int,       u_pre + u_int]
-        #   Inactive (a_n1_org=0): zˆ ∈ [l_pre + l_int, u_int      ]
-        #
-        # l < 0 < u is guaranteed (split case). Big-M = u + |l|.
-        # Skip when no_n1_binaries_and_relaxtions_only_on_n2 is active (N1 binaries are LP-relaxed).
+        # Unreachable: retired transfer-mode relaxation (use_relaxations is permanently false).
         if use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && (network_version == "n2_org" || network_version == "n2_pert" || network_version == "perturbation")
             m_idx = layer_counter         # ReLU layer index within current network (1-based, reset per pass)
             k_idx = neurons_names.neuron  # neuron index within the layer (1-based)
@@ -518,12 +480,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
             end
         end
 
-        # ── Transfer-aware: replace N2 binary with triangle relaxation when N1 neuron is stable ──
-        # If N1's corresponding neuron has a known activation status (always active or
-        # always inactive), N2's activation is tightly constrained by the diff bounds.
-        # We can replace N2's binary variable with a triangle LP relaxation — sound
-        # (delta_diff >= exact) and tight when diff bounds are narrow.
-        # Standard mode cannot do this (no reference network).
+        # Unreachable: retired transfer-mode branch (its threshold is never set and the "n2_org"/"n2_pert" copies are never built).
         if n1_stability_relax_threshold >= 0 && (network_version == "n2_org" || network_version == "n2_pert")
             m_idx = layer_counter
             k_idx = neurons_names.neuron
@@ -548,16 +505,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
             end
         end
 
-        # ── advstd Technique 6 (BoundTightPertRelax): tiered per-copy N2 relaxation ──
-        # Decision dict n2_relax_decision is precomputed by
-        # compute_n2_relax_decision! (run.jl) using N2's per-copy final
-        # tightened bounds. Tiered rule:
-        #   max(g_org, g_pert) ≤ τ → relax both copies
-        #   min(g_org, g_pert) ≤ τ → relax only the smaller-gap copy
-        #   else                   → keep both exact
-        # Sound: the emitted triangle uses the same (l, u) as the exact
-        # encoding would, so every x ∈ F_exact remains feasible here; hence
-        # δ_BTPR ≥ δ_exact (see §4 of advstd_techniques.tex).
+        # The Conditional Triangle: if the decision map marked this copy of the neuron for relaxation, encode its ReLU as the triangle (no binary variable) instead of the exact encoding; apply_sibgate_constraints! later adds the coupling or sibling-gated constraints.
         if adv_std_n2_relax_threshold >= 0.0 &&
            (network_version == "org" || network_version == "perturbation") &&
            !isempty(n2_relax_decision)
@@ -584,12 +532,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
                     else
                         global n_n2_relaxed_binaries_pert += 1
                     end
-                    # Technique 4 (SibGate): record this neuron's MIP state
-                    # so the post-encoding pass can add the conditional
-                    # triangle (one-thin tier) or the pre-act coupling line
-                    # (both-thin tier) for it. Stored under (m_idx, k_idx,
-                    # network_version) where m_idx = layer_counter so the
-                    # post-pass can pair org with pert at the same neuron.
+                    # Save this relaxed neuron's pieces (pre-activation, [l, u], output) so apply_sibgate_constraints! can pair the two copies and add its constraints.
                     if adv_std_n2_sibling_gate
                         n2_relu_state[(layer_counter, neurons_names.neuron, network_version)] =
                             (preact=x, l=l, u=u, x_rect=x_rect)
@@ -604,7 +547,7 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         push!(layers_info_dict,(neurons_names.layer,neurons_names.neuron)=>(u,l,length(av)))
         # since we know that u!=l, x is not constant, and thus x must have an associated model
         x_rect = @variable(model)
-        # LP-relax N1 binaries when no_n1_binaries_and_relaxtions_only_on_n2 is active
+        # The first arm is a retired switch (permanently false) — a is always a binary variable.
         if no_n1_binaries_and_relaxtions_only_on_n2 && network_version == "n1_org"
             a = @variable(model)
             set_lower_bound(a, 0.0)
@@ -614,27 +557,20 @@ function relu(x::T, l::Real, u::Real)::JuMP.AffExpr where {T<:JuMPLinearType}
         end
     	set_name(x_rect,string(network_version,"x_rect","_","layerCount",layer_counter,"_","neuronCount",nueron_counter,"_",string(neurons_names.layer),"_",string(neurons_names.neuron)))
     	set_name(a,string(network_version,"a","_","layerCount",layer_counter,"_","neuronCount",nueron_counter,"_",string(neurons_names.layer),"_",string(neurons_names.neuron)))
-        # refined big-M formulation that takes advantage of the knowledge
-        # that lower and upper bounds  are different.
+        # The exact ReLU encoding: four constraints tying the output x_rect to the pre-activation x through the binary a on [l, u].
         @constraint(model, x_rect <= x + (-l) * (1 - a))
         @constraint(model, x_rect >= x)
         @constraint(model, x_rect <= u * a)
         @constraint(model, x_rect >= 0)
 
-        # Technique 4 (SibGate): record exact-encoded N2 sides too. The
-        # post-encoding pass needs the sibling's `x` (preact AffExpr) and
-        # (l, u) when the sibling is exact (e.g., one-thin tier where this
-        # copy keeps its binary while the other was dropped).
+        # Save exact-encoded neurons too: when only one copy is relaxed, apply_sibgate_constraints! needs the exact sibling's pieces (pre-activation, [l, u]) to gate the triangle on its binary.
         if adv_std_n2_sibling_gate &&
            (network_version == "org" || network_version == "perturbation")
             n2_relu_state[(layer_counter, neurons_names.neuron, network_version)] =
                 (preact=x, l=l, u=u, x_rect=x_rect)
         end
 
-        # ── Cross-copy linking: conditional constraints using N2(x)'s binary ──
-        # Links N2(x') post-ReLU to N2(x)'s activation via perturbation bounds
-        # derived through N1's zonotope. Sound: tightens LP relaxation without
-        # removing any binaries. Transfer-only (standard has no second copy).
+        # Unreachable: retired transfer-mode branch (its switch is permanently false).
         if constrain_n2_xp_via_n1_zonotope && network_version == "n2_pert"
             m_idx = layer_counter
             k_idx = neurons_names.neuron
